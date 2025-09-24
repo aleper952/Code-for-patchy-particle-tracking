@@ -23,6 +23,8 @@ import ExtraFunctions as ef
 import One_channel as oc
 import xml.etree.ElementTree as ET
 from collections import Counter
+import networkx as nx
+from scipy.spatial import cKDTree
 
 def make_network(patch_coo,dist_treshold,tolerance):
     '''
@@ -63,6 +65,51 @@ def make_network(patch_coo,dist_treshold,tolerance):
         #except KeyError:
          #   pass
     return curdict, distance_dict, distance_vector_dict
+
+def make_graph(network, patch_coo):
+    G = nx.Graph() # Create an empty graph
+
+    for node, neighbors in network.items():
+        for neigh in neighbors:
+            G.add_edge(node, neigh)
+
+    network_coord = {key: tuple(patch_coo[key])[::-1] for key in network.keys() if key in patch_coo} # reorder coordinates to x,y,z
+    # Assign the coordinates to the nodes in the graph
+    for node, (x, y, z) in network_coord.items():
+        if node in G:
+            G.nodes[node]["x"] = x
+            G.nodes[node]["y"] = y
+            G.nodes[node]["z"] = z
+    components = list(nx.connected_components(G)) # Create a list of connected components      
+
+    return G, components
+
+def nearest_centroids(components, G):
+    '''Find the nearest centroids of each component in the graph G using KD trees'''
+    centroids = np.zeros((len(components), 3))
+    for i, comp in enumerate(components):
+        points = np.array([[G.nodes[n]['x'], G.nodes[n]['y'], G.nodes[n]['z']] for n in comp])
+        centroids[i] = points.mean(axis=0) # compute the centroid of every cluster
+   
+    tree = cKDTree(centroids) # create a KD tree for the centroids
+    dists, idxs = tree.query(centroids, k=2)
+    nearest_distances = dists[:, 1]  # distance to nearest other centroid
+    nearest_indices = idxs[:, 1]     # index of nearest other centroid
+    return nearest_distances, nearest_indices
+
+def ds_centroids(components, G):
+    '''Find the nearest centroids of each component in the graph G using KD trees'''
+    centroids = np.zeros((len(components), 3))
+    for i, comp in enumerate(components):
+        points = np.array([[G.nodes[n]['x'], G.nodes[n]['y'], G.nodes[n]['z']] for n in comp])
+        centroids[i] = points.mean(axis=0) # compute the centroid of every cluster
+    centroids_dists = cdist(centroids, centroids) # compute the distance between every centroid
+    dists_list = []
+    n = centroids_dists.shape[0]
+    for i in range(n):
+        for j in range(i+1, n):
+            dists_list.append(centroids_dists[i, j])    
+    return np.array(dists_list)
 
 def compute_angles_between_patches(vectors):
     ''' 
@@ -109,7 +156,7 @@ def compute_all_distancesandangles(vectors):
         j = np.array(j)
         #print(f"i {i} j {j} for identifier {identifier}")
         vij = i - j
-        vij_norm = np.sqrt((i[2]-j[2])**2 +(i[1]-j[1])**2+(i[0]-j[0])**2 ) # norm computed as sqrt((x1-x2)**2 + (y1-y2)**2 + (z1-z2)**2)   #np.linalg.norm(vij)
+        vij_norm = np.sqrt((i[2]-j[2])**2 +(i[1]-j[1])**2+(i[0]-j[0])**2 ) # norm computed as sqrt((x1-x2)**2 + (y1-y2)**2 + (z1-z2)**2)   
         #print(f"||vij|| {vij_norm} for identifier {identifier}")
         if np.linalg.norm(i) > 0 and np.linalg.norm(j) > 0:
             cos = np.dot(i,j)/(np.linalg.norm(i) * np.linalg.norm(j)) # clip ensure that the value gets rounded to a good one
@@ -126,6 +173,7 @@ def compute_all_distancesandangles(vectors):
     return vects, distances, angles
 
 def find_shape(network,vectors_in_network,dist_treshold,dist_tolerance,target_angle,ang_tolerance):
+
     ''' 
         This function reconstruct the shape we can find in the network based on the neighbors:
             2 neighbors --> look for regular triangles
@@ -138,7 +186,12 @@ def find_shape(network,vectors_in_network,dist_treshold,dist_tolerance,target_an
         Returns:
         :triangle_neighbors: dict of patches id in the triangles  
         :triangle_vectors: dict of distance vectors between patches in the triangle  
+
+        PROBLEM: the zip function in "find_shape()", if any pair of edges of the potential tetrahedron are identified as being a triangle, 
+        you record the whole set of neighbours as being a tetrahedron. I think this is sort of along the right lines, but you'd want to check if every set of edges are triangles and then add it to the list of tetrahedrons.
     '''
+
+    pairs = {}
     triangle_neighbors = {}
     triangle_vectors = {}
     tetra_neighbors = {}
@@ -146,7 +199,8 @@ def find_shape(network,vectors_in_network,dist_treshold,dist_tolerance,target_an
     #angles = compute_angles_between_patches(vectors_in_network) # compute the angles between the vectors in the network
     for identifier, neighbors in network.items():
         if len(neighbors) < 2:
-            continue
+            pairs[identifier] = []
+            pairs[identifier].append(neighbors) # store the patches with only 1 neighbor
         if len(neighbors) == 2:
             #d1 = distances_in_network[identifier][0]
             #d2 = distances_in_network[identifier][1]
@@ -154,7 +208,7 @@ def find_shape(network,vectors_in_network,dist_treshold,dist_tolerance,target_an
             #v1 = vectors_in_network[identifier][0] # vector distance between the identifier and the first neighbor
             #v2 = vectors_in_network[identifier][1] # vector distance between the identifier and the second neighbor
             #for angle in angles[identifier]: # angle between the identifier and the two neighbors
-            for tr_d, tr_a in zip(tr_dists, tr_angles):
+            for tr_d, tr_a in zip(tr_dists, tr_angles): # pair distances and angles
                 if (target_angle - ang_tolerance < tr_a < target_angle + ang_tolerance): # to go over the angles
                     #d12 = np.array(v1) - np.array(v2)
                     #d12_norm = np.linalg.norm(d12)
@@ -175,7 +229,73 @@ def find_shape(network,vectors_in_network,dist_treshold,dist_tolerance,target_an
                         tetra_neighbors[identifier].append(neighbors) 
                         tetra_vectors[identifier].append(dists)
 
-    return triangle_neighbors, triangle_vectors, tetra_neighbors, tetra_vectors      
+    return pairs, triangle_neighbors, triangle_vectors, tetra_neighbors, tetra_vectors
+
+def find_shape_2(network,vectors_in_network,dist_treshold,dist_tolerance,target_angle,ang_tolerance):
+    ''' 
+        This function reconstruct the shape we can find in the network based on the neighbors:
+            2 neighbors --> look for regular triangles
+            3 neighbors ---> look for a regular tethraedron 
+            < 3 neighbors --> look for a regular triangle or a tethraedron
+        Takes:  
+            :network: dict of the patches in the network. Give the patch identifier and I give you its neighbors
+            :vectors_in_network: dict of the vectors. Give the patch identifier and I give you the distance between its neighbors
+            :target_angle: float angle value (60° in our case)
+            :ang_tolerance: float of the tolerance on the target_angle
+        Returns:
+        :triangle_neighbors: dict of patches id in the triangles  
+        :triangle_vectors: dict of distance vectors between patches in the triangle  
+    '''
+    pairs = {}
+    triangle_neighbors = {}
+    triangle_edges = {}
+    tetra_neighbors = {}
+    tetra_edges = {}
+    for identifier, neighbors in network.items():
+        if len(neighbors) < 2:
+            pairs[identifier] = []
+            pairs[identifier].append(neighbors) # store the patches with only 1 neighbor
+        if len(neighbors) == 2:
+            #d1 = distances_in_network[identifier][0]
+            #d2 = distances_in_network[identifier][1]
+            tr_vects, tr_dists, tr_angles = compute_all_distancesandangles(vectors_in_network[identifier]) # passing the function a list which contains only the vectors of the id
+            #v1 = vectors_in_network[identifier][0] # vector distance between the identifier and the first neighbor
+            #v2 = vectors_in_network[identifier][1] # vector distance between the identifier and the second neighbor
+            #for angle in angles[identifier]: # angle between the identifier and the two neighbors
+            #all_angles_tr = all(math.isclose(a, target_angle, abs_tol=ang_tolerance) for a in tr_angles)
+            all_dists_tr = all(math.isclose(d, dist_treshold, abs_tol=dist_tolerance) for d in tr_dists)
+            if all_dists_tr:
+                triangle_neighbors[identifier] = []
+                triangle_edges[identifier] = []
+                triangle_neighbors[identifier].append(neighbors)
+                triangle_edges[identifier].append(tr_dists)
+
+        if len(neighbors) == 3:
+            vects, dists, angs = compute_all_distancesandangles(vectors_in_network[identifier]) # passing the function a list which contains only the vectors of the identifier
+            # check all the faces of the tetrahedron
+            #all_angles = all(math.isclose(a, target_angle, abs_tol=ang_tolerance) for a in angs)
+            #all_dists = all(math.isclose(d, dist_treshold, abs_tol=dist_tolerance) for d in dists)
+            ang_checks = [math.isclose(a, target_angle, abs_tol=ang_tolerance) for a in angs]
+            dist_checks = [math.isclose(d, dist_treshold, abs_tol=dist_tolerance) for d in dists]            
+            #all_angles = all(target_angle - ang_tolerance < a < target_angle + ang_tolerance for a in angs)
+            #all_dists = all(dist_treshold - dist_tolerance < d < dist_treshold + dist_tolerance for d in dists)
+            #print(all_dists)
+            #if all_angles and all_dists:
+            if sum(dist_checks) >= 1 and sum(ang_checks) >= 1: # if at least one distance and one angle is ok, store the tetrahedron
+                tetra_neighbors[identifier] = []
+                tetra_edges[identifier] = []
+                tetra_neighbors[identifier].append(neighbors) 
+                tetra_edges[identifier].append(dists)
+            # print(f"for id {identifier} distances between vertices {dists} and angles between vertices {angs}")
+            #for d,a in zip(dists, angs): # add a condition here that check that every face of the tetra is ok
+             #   if (target_angle - ang_tolerance < a < target_angle + ang_tolerance): # to go over the angles
+              #      if (dist_treshold - dist_tolerance < d < dist_treshold + dist_tolerance): # to go over the distances
+               #         tetra_neighbors[identifier] = []
+                #        tetra_vectors[identifier] = []
+                 #       tetra_neighbors[identifier].append(neighbors) 
+                  #      tetra_vectors[identifier].append(dists)
+
+    return pairs, triangle_neighbors, triangle_edges, tetra_neighbors, tetra_edges
 
 def is_triangle_in_tetrahedron(cleaned_triangles_neighbors, cleaned_tetras_neighbors):
     """
@@ -334,6 +454,7 @@ def longest_key(network):
     Takes:
         :network: dict of the patches in the network.
     '''
+    all_nbs_lengths = []
     # Find the key with the longest list in the network dictionary
     max_key = max(network, key=lambda k: len(network[k])) #key = lambda k: len(network[k])) determines the value to compare for each key. 
     max_length = len(network[max_key])
@@ -348,7 +469,10 @@ def longest_key(network):
     sorted_length_counts = dict(sorted(length_counts.items())) # sort the dict by key (length of the list)
 
     for length, count in sorted_length_counts.items():
+        all_nbs_lengths.append((length, count))
         print(f"Length {length} occurs {count} times")
+
+    return all_nbs_lengths    
 
 def is_shared(cleaned_tetras_neighbors):
     ''' 
